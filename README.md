@@ -1,4 +1,4 @@
-# Qwen-for-Zork
+# Qwen-for-Zork(on going)
 
 基于本地部署的 Qwen-chat-7b-int4 模型实现一个基于 PPO 算法的 online RL 微调，用于在文字冒险游戏 Zork 中进行探索和决策。
 项目使用 Proximal Policy Optimization (PPO) 算法，并结合了 LoRA 技术优化模型训练。
