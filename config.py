@@ -1,0 +1,51 @@
+import torch
+from peft import LoraConfig, TaskType
+
+# ============================ 参数配置 ============================
+MODEL_PATH = "/root/autodl-fs/R3LM/Qwen_chat7b_int4"      
+ROM_PATH = "/root/autodl-fs/R3LM/z-machine-games-master/jericho-game-suite/zork1.z5" 
+SAVE_DIR = "/root/autodl-fs/R3LM/CheckpointSaves"
+LOG_DIR = "/root/autodl-fs/R3LM/RL_Logger"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# PPO 参数
+PPO_CLIP_EPS = 0.2      # PPO 的 clip epsilon
+PPO_EPOCHS = 2          # 训练时 PPO 的 epoch 数
+PPO_LR = 1e-6           # 学习率
+MAX_GRAD_NORM = 0.5     # 梯度裁剪的最大范数
+ENTROPY_COEFF = 0.03    # 熵正则化系数 通常0.01-0.05
+ENTROPY_DECAY = 0.995      # 熵衰减系数
+VALUE_LOSS_COEFF = 0.5  # 价值损失系数：控制 critic 网络学习的重要性，大可能压制策略更新，小可能学习不到准确状态
+
+# 训练参数
+MAX_EPISODES = 10       # 总回合数
+EPISODE_STEPS = 8     # 单个回合最大步数
+ACCUMULATION_STEP = 4   # 累积梯度的步数
+BATCH_SIZE = 8          # 批次大小 
+
+EPISODES_PER_UPDATE = 2  # 每次更新的回合数
+MAX_TOTAL_STEPS = 10000  # 最大训练步数
+SAVE_INTERVAL = 50  # 保存模型的间隔步数
+
+# PPOBuffer 参数
+MAX_SIZE = 1000         # buffer 的 max 大小
+GAE_LAMBDA = 0.95       # Generalized Advantage Estimation 参数
+
+# Agent 参数
+GAMMA_DISCNT = 0.98         # 折扣因子
+GAE_TAU = 0.95         # GAE 的 tau 参数, 平衡因子
+MAX_HISTORY_LENGTH = 10  # agent 的历史记录动作次数上限
+
+# Env 参数
+GAME_RATIO = 2         # 计算 reward 时 游戏得分 的比例 
+MAX_NO_SCORE_TIME = 5   # 连续 __ 步没有得分(就惩罚)
+
+# ============================ LoRA 配置 ============================
+lora_config = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    target_modules=["attn.c_attn", "attn.c_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type=TaskType.CAUSAL_LM
+)
