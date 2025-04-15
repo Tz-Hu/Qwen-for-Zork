@@ -8,12 +8,10 @@ from peft import get_peft_model, prepare_model_for_kbit_training
 from config import (
     MODEL_PATH, device, lora_config, MAX_EPISODES,
     ENTROPY_COEFF, ENTROPY_DECAY, VALUE_LOSS_COEFF, GAMMA_DISCNT,
-    GAE_TAU, PPO_CLIP_EPS, PPO_EPOCHS, PPO_LR, MAX_GRAD_NORM,MAX_HISTORY_LENGTH)
+    GAE_LAMBDA, PPO_CLIP_EPS, PPO_EPOCHS, PPO_LR, MAX_GRAD_NORM,MAX_HISTORY_LENGTH)
 from Qwen_chat7b_int4.qwen_generation_utils import make_context, get_stop_words_ids, decode_tokens
 
-    ###############################
-    #            Agent            #
-    ###############################
+
 class PPOAgent():
     def __init__(self, device = device):
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -24,23 +22,22 @@ class PPOAgent():
             output_hidden_states=True,
             padding_side='left'
         )
-        # 初始化 PPOAgent，传入 Actor、Critic 模型、 和有效动作集
         self.device = device  
         self.model = AutoModelForCausalLM.from_pretrained(
             MODEL_PATH,
             device_map="auto",
-            use_flash_attn=False,
+            use_flash_attn=True,
             use_cache=False,  # 说是显式设置为 False 以兼容梯度检查点
             trust_remote_code=True
         )
-        self.history = []  # 初始化历史记录
-        self.actor = PPOActor(self)  # Actor 模型
-        self.critic = PPOCritic(self)  # Critic 模型
+        self.actor = PPOActor(self)
+        self.critic = PPOCritic(self)
+        self.history = []
         self.entropy_coeff = ENTROPY_COEFF
 
-    # 重置 history
-    def reset_history(self):
+    def reset(self):
         self.history = []
+        self.entropy_coeff = ENTROPY_COEFF
 
     # 更新历史记录，将新的 query 和 response 加入 history
     def update_history(self, query, response):
@@ -50,77 +47,83 @@ class PPOAgent():
         if len(self.history) > MAX_HISTORY_LENGTH:
             self.history = self.history[-MAX_HISTORY_LENGTH:]
 
-    # 用 PPOActor 来选择动作
-    def choose_action(self, obs, valid_actions):
-        prompt = self.actor.build_prompt(obs, valid_actions)
-        
-        response, _, _, _ = self.actor.chat_with_ids(prompt)  
-        self.update_history(prompt, response)
-        
-        # 提取 response 中的最后一个数字并将其转换为索引动作
-        match = re.search(r'\d+', response.strip())
-        if match:
-            action_idx = int(match.group()) - 1  # 转换为 0 开始的索引
-            if 0 <= action_idx < len(valid_actions):
-                return valid_actions[action_idx]
-        # 如果未能提取有效动作，返回默认动作
-        return response
+    def compute_advantage_returns(self, 
+                          step_rewards: torch.Tensor,
+                          state_values: torch.Tensor, 
+                          next_value: float = 0.0, 
+                          gamma=GAMMA_DISCNT, 
+                          gae_lambda=GAE_LAMBDA,
+                          normalize: bool = True) -> torch.Tensor:
+        device = step_rewards.device
+        state_values = state_values.to(device)
 
-    # 计算损失函数
-    def compute_loss(self, batch):
-        # 获取历史 logprob
-        state_values = self.critic.evaluate_values(batch.observations) 
-        old_logprobs = torch.stack(batch.old_logprobs).to(device)
-        rewards = torch.tensor(batch.rewards, device=device)
-        advantages = self.compute_advantage(rewards, state_values, batch.next_value)
-        # 计算当前 logprobs
-        logprobs = self.actor.compute_logprob(batch.observations, batch.valid_actions)
-        # 计算熵 , 变成负数
-        entropy = -torch.mean(torch.sum(torch.exp(logprobs) * logprobs, dim=-1))
-        # entropy_coeff = ENTROPY_COEFF
+        T = len(step_rewards)
+        advantages = torch.zeros_like(step_rewards, device=device)
+        last_gae = 0.0
 
-        # 1. 策略损失：policy_loss
-        # # 计算重要性采样比率
-        ratio = torch.exp(logprobs - old_logprobs)
-        policy_loss_clip = torch.min(ratio * advantages, 
-                                     torch.clamp(ratio, 1 - PPO_CLIP_EPS, 1 + PPO_CLIP_EPS) * advantages)
+        # 反向计算 GAE 
+        with torch.no_grad():
+            for t in reversed(range(T)):
+                delta = step_rewards[t] + gamma * next_value - state_values[t]
+                last_gae = delta + gamma * gae_lambda * last_gae
+                advantages[t] = last_gae
+                next_value = state_values[t]
+        returns = advantages + state_values[:-1]
     
-        # 负号因为希望最大化
-        policy_loss = - torch.mean(policy_loss_clip)  
-
-        # 2. 价值损失：value_loss
-        value_loss = VALUE_LOSS_COEFF * F.mse_loss(state_values, batch.returns)  # 均方误差损失
-
-        # 3. 熵损失：loss_entropy
-        entropy_loss = self.entropy_coeff * entropy
+        # 计算回报值
+        returns = advantages + state_values[:-1]  # 需要确保values长度=T+1
         
-        # 总损失：loss = loss_pi + loss_value_error + loss_entropy
-        loss = policy_loss + value_loss + entropy_loss
-        self.entropy_coeff *= ENTROPY_DECAY
+        # 可选：标准化优势
+        if normalize and len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        return advantages, returns
+    
+    # 计算损失函数
+    def compute_loss(self, batch)->tuple:
+        old_logprob = batch.old_logprob
+        logprob = batch.logprob
+        state_values = batch.state_values
+        step_rewards = batch.step_rewards
+        advantages, returns = self.compote_advantage_returns(step_rewards, state_values)
+        entropy_coef: float = ENTROPY_COEFF,  # 熵奖励权重
+        clip_epsilon: float = PPO_CLIP_EPS,   # PPO截断阈值
 
-        return loss
+        ratio = torch.exp(logprob - old_logprob.detach())
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * advantages
+        policy_loss = -torch.min(surr1, surr2).mean()
 
-    def compute_advantage(self, rewards, values, next_value, gamma=GAMMA_DISCNT, tau=GAE_TAU): 
-        values = torch.cat([values, next_value.view(1)], dim=0)
-        # TD Residual
-        # rewards = torch.tensor(rewards, device=values.device, dtype=values.dtype)
-        if not isinstance(rewards, torch.Tensor):
-            rewards = torch.tensor(rewards, device=values.device, dtype=values.dtype)
-        else:
-            rewards = rewards.to(device=values.device, dtype=values.dtype)
-        deltas = rewards + gamma * values[1:] - values[:-1]
+        value_loss = F.mse_loss(state_value, returns, reduction='mean')
 
-        advantages = torch.zeros_like(rewards)
-        last_gae_lam = 0
-        for t in reversed(range(len(rewards))):
-            last_gae_lam = deltas[t] + gamma * tau * last_gae_lam
-            advantages[t] = last_gae_lam
-            
-        return advantages.detach()
+        entropy = -torch.exp(logprob) * logprob  # 计算熵 [batch_size]
+        entropy_loss = -entropy.mean() * entropy_coef  # 负号因为要最大化熵
 
-    ###############################
-    #            Actor            #
-    ###############################
+        total_loss = policy_loss + value_coef * value_loss + entropy_loss
+
+        # # 监控指标：近似KL散度（不需要反向传播）
+        # with torch.no_grad():
+        #     approx_kl = 0.5 * torch.mean((old_logprob - logprob)**2)  # Fisher信息近似
+
+        return total_loss 
+        # return total_loss, policy_loss, value_loss, entropy_loss, approx_kl
+# # ===================
+#         # 1. 策略损失：policy_loss
+#         # # 计算重要性采样比率
+#         ratio = torch.exp(logprobs - old_logprobs)
+#         policy_loss_clip = torch.min(ratio * advantages, 
+#                                      torch.clamp(ratio, 1 - PPO_CLIP_EPS, 1 + PPO_CLIP_EPS) * advantages)
+#         # 负号因为希望最大化
+#         policy_loss = - torch.mean(policy_loss_clip)  
+#         # 2. 价值损失：value_loss
+#         value_loss = VALUE_LOSS_COEFF * F.mse_loss(state_values, batch.returns)  # 均方误差损失
+#         # 3. 熵损失：loss_entropy
+#         entropy_loss = self.entropy_coeff * entropy
+#         # 总损失：loss = loss_pi + loss_value_error + loss_entropy
+#         loss = policy_loss + value_loss + entropy_loss
+#         self.entropy_coeff *= ENTROPY_DECAY
+#         return loss
+
 class PPOActor(nn.Module):
     def __init__(self, agent):
         super().__init__()
@@ -150,8 +153,8 @@ class PPOActor(nn.Module):
         self.get_stop_words_ids = get_stop_words_ids
         self.decode_tokens = decode_tokens
     
-    # chat 源码改编。query填入每次的 prompt
-    def chat_with_ids(self, query, system=f"""You are playing the role of a professional player in the text-based adventure game Zork. You can earn rewards by exporing new place, solve puzzles, collecting treasures and defeating bad guys. You need to choose the best action from the list of valid actions to maximize your score.""", generation_config=None, **kwargs):
+                                # chat 源码改编。query填入每次的 prompt
+    def chat_with_ids(self, query, system=f"""You are playing the role of a professional player in the text-based adventure game Zork. You can earn rewards by solve puzzles, collecting treasures and defeating bad guys. You need to choose the best action from the list of valid actions to maximize your score.""", generation_config=None, **kwargs):
         generation_config = self.generation_config
 
         history = self.history  # 获取历史记录
@@ -191,16 +194,19 @@ class PPOActor(nn.Module):
 
         return response, history, input_ids, gen_tokens
 
-    # 计算生成动作的 log 概率
-    def compute_logprob(self, obs, valid_actions, history=None):
+    def generate_action_logprob(self, obs, valid_actions):
         prompt = self.build_prompt(obs, valid_actions)
-        # 如果没有提供历史记录，使用代理的历史记录
-        if history is None:
-            history = self.history
-        
+        history = self.history
         # 生成动作
         response, _, input_ids, gen_tokens = self.chat_with_ids(prompt)
+        self.update_history(prompt, response)
         
+        match = re.search(r'\d+', response.strip())
+        if match:
+            action_idx = int(match.group()) - 1  # 转换为 0 开始的索引
+            if 0 <= action_idx < len(valid_actions):
+                return valid_actions[action_idx]
+            
         # 计算生成动作的 log 概率
         with torch.no_grad():  # 禁用梯度计算以节省内存
             outputs = self.actor_model(input_ids)
@@ -209,9 +215,9 @@ class PPOActor(nn.Module):
             gen_log_probs = log_probs.gather(2, gen_tokens.unsqueeze(-1)).squeeze(-1)
             total_log_prob = gen_log_probs.sum(dim=-1)
         
-        return total_log_prob[0]
-        # history = self.agent.history  # 获取历史记录
+        return response, total_log_prob[0]
 
+    
     def filter_copyright(self, text):
         """ 过滤包含版权信息的行 """
         keywords = ["Copyright", "Microsoft Corporation", "GNU General Public License", "Serial number", "ZORK is a registered trademark"]
@@ -256,25 +262,20 @@ class PPOCritic(nn.Module):
             return_attention_mask=True  # 显式要求返回attention mask
         ).to(device)
         
-        # 从tokenized对象中获取input_ids和attention_mask
         input_ids = tokenized.input_ids
-        attention_mask = tokenized.attention_mask
-        # 禁用梯度计算以节省内存
         with torch.no_grad():
-            # 使用 Critic 模型对输入的 token 序列进行前向传播，获取输出
             outputs = self.critic_model(input_ids, output_hidden_states=True)
             
-            # 提取最后一层的 hidden state（作为状态价值的估计）
-            last_hidden_state = outputs.hidden_states[-1].to(dtype=torch.float32)  # 转换为 float32 类型
-            pooled = last_hidden_state.mean(dim=1)
+            # last_hidden_state = outputs.hidden_states[-1].to(dtype=torch.float32)  # 转换为 float32 类型
+            # pooled = last_hidden_state.mean(dim=1)
+            pooled = outputs.hidden_states[-1].mean(dim=1)
 
-        state_value = self.value_head(pooled).squeeze(-1) 
-        state_value = state_value.float()  # 转换为 float32 类型
-        # state_value = state_value.to(dtype = torch.float32, device = device)
-        return state_value
+        # state_value = self.value_head(pooled).squeeze(-1) 
+        # state_value = state_value.float()  # 转换为 float32 类型
+        return self.value_head(pooled).squeeze(-1) 
 
     # 计算 状态价值
-    def evaluate_values(self, obs):
+    def evaluate_value(self, obs):
         return self.forward(obs)
 
     # 计算 价值损失
