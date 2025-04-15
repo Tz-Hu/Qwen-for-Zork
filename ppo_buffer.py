@@ -1,35 +1,51 @@
 import torch
 
-# PPOBuffer 参数
-MAX_SIZE = 1000
-GAE_LAMBDA = 0.95
-GAMMA = 0.99
-
 class PPOBuffer:
-    def __init__(self, gae_lambda=GAE_LAMBDA, max_size=MAX_SIZE):
-        self.gae_lambda = gae_lambda
-        self.max_size = max_size
+    def __init__(self):
         self.reset()
 
     def reset(self):
-        self.state_values = []  
-        self.observations = []
-        self.next_value = []
-        self.rewards = []
-        self.done = []
         self.old_logprobs = []
+        self.logprobs = []
+        self.actions = []
+        self.done = []
+        self.step_rewards = []
+        self.discnt_returns = []
+        self.state_values = []
+        self.next_value = None
+
+
+        self.obs = []
+        self.next_value = []
         self.advantages = []
-        self.returns = []
         self.history = []
         self.valid_actions = []
 
-    def add(self, obs, reward, state_value, done, old_logprob, history, valid_actions):
-        self.observations.append(obs)
-        self.rewards.append(reward)
+    def add_obs(self, obs):
+        self.obs.append(obs)
+
+    def add_step_reward(self, reward):
+        self.step_rewards.append(reward)
+
+    def add_state_value(self, state_value):
         self.state_values.append(state_value)
-        self.done.append(int(done)) # done = 1 : 当前步骤导致环境终止
+
+    def add_done(self, done):
+        self.done.append(int(done))
+
+    def add_old_logprob(self, old_logprob):
         self.old_logprobs.append(old_logprob)
-        self.history.append(history.copy())
+    
+    def add_logprob(self, logprob):
+        self.logprobs.append(logprob)
+
+    def add_discnt_return(self, discnt_returns):
+        self.discnt_returns = discnt_returns
+
+
+
+    def add(self, obs, reward, state_value, done, old_logprob, valid_actions):
+        # self.history.append(history.copy())
         self.valid_actions.append(valid_actions.copy())
     
     def get_batches(self, batch_size):
@@ -37,7 +53,7 @@ class PPOBuffer:
         shuffled_obs = [self.observations[i] for i in indices]
         # shuffled_next_value = [self.next_value[i] for i in indices]
         shuffled_next_value = self.next_value
-        shuffled_rewards = [self.rewards[i] for i in indices]
+        shuffled_rewards = [self.step_rewards[i] for i in indices]
         shuffled_dones = [self.done[i] for i in indices]
         shuffled_old_logprobs = [self.old_logprobs[i] for i in indices]
         shuffled_advantages = [self.advantages[i] for i in indices]
@@ -52,7 +68,7 @@ class PPOBuffer:
                 observations=shuffled_obs[i:i+batch_size],
                 next_value=shuffled_next_value,
                 # next_value=shuffled_next_value[i:i+batch_size],
-                rewards=shuffled_rewards[i:i+batch_size],
+                step_rewards=shuffled_rewards[i:i+batch_size],
                 dones=shuffled_dones[i:i+batch_size],
                 old_logprobs=shuffled_old_logprobs[i:i+batch_size],
                 advantages=torch.tensor(shuffled_advantages[i:i+batch_size], device="cuda", dtype=torch.float32),
@@ -62,11 +78,11 @@ class PPOBuffer:
             )
 
 class Batch:
-    # def __init__(self, observations, rewards, dones, old_logprobs, advantages, returns, history, valid_actions):
-    def __init__(self, observations, next_value, rewards, dones, old_logprobs, advantages, returns, history, valid_actions):
+    # def __init__(self, observations, step_rewards, dones, old_logprobs, advantages, returns, history, valid_actions):
+    def __init__(self, observations, next_value, step_rewards, dones, old_logprobs, advantages, returns, history, valid_actions):
         self.observations = observations
         self.next_value = next_value
-        self.rewards = rewards
+        self.step_rewards = step_rewards
         self.dones = dones
         self.old_logprobs = old_logprobs
         self.advantages = advantages
