@@ -1,21 +1,14 @@
 from collections import deque
 from jericho import FrotzEnv
-from config import ROM_PATH, GAME_RATIO, GAMMA_DISCNT
+from config import ROM_PATH, GAME_RATIO, GAMMA_DISCNT, MAX_ACTION_HISTORY
 from math import log
     
 # ============================ Zork 环境类 ============================
 class ZorkEnvWrapper:
-    def __init__(self, agent):
-        self.agent = agent
+    def __init__(self):
         self.env = FrotzEnv(ROM_PATH)
-        self.obs, self.info = self.env.reset()
-        self.valid_actions = self.env.get_valid_actions()
-        self.visited_rooms = set()  # 用于状态跟踪，自定义奖励计算
-        self.last_score = 0
-        self.action_history = deque(maxlen=10)  # 用于跟踪动作历史，避免重复动作
         self.reset()
 
-    # 新游戏
     def reset(self):
         """"        
         self.close()
@@ -24,44 +17,13 @@ class ZorkEnvWrapper:
         score = self.frotz_lib.get_score()
         return obs_ini, {'moves':self.get_moves(), 'score':score}
         """
-        self.visited_rooms.clear()  # 重置访问过的房间
-        # self.track_visited_room(self.obs)
-        self.last_score = (self.info.get('score', 0))
-        return self.env.reset()
+        self.visited_rooms = set()
+        self.obj_touched = set()
+        self.valid_actions = self.env.get_valid_actions()
+        self.action_history = deque(maxlen=MAX_ACTION_HISTORY)
+        self.feedback = ""
+        self.obs, self.info = self.env.reset()
 
-# 跟踪访问过的房间
-    def track_visited_room(self, room):
-        self.visited_rooms.add(room)
-
-# --------------------------# --------------------------# --------------------------
-# # # # # # # 以下为jericho中的复用
-# 查看游戏种子, 没什么用
-    def seed(self, seed=None):
-        '''
-        Changes seed used for the emulator's random number generator.
-
-        :param seed: Seed the random number generator used by the emulator.
-                     Default: use walkthrough's seed if it exists,
-                              otherwise use value of -1 which changes with time.
-        :returns: The value of the seed.
-
-        .. note:: :meth:`jericho.FrotzEnv.reset()` must be called before the seed takes effect.
-        '''
-        return self.env.seed(seed)
-
-    # 步进函数
-    def step(self, action):
-
-        # old_score = self.frotz_lib.get_score()
-        # next_state = self.frotz_lib.step(action_bytes + b'\n').decode('cp1252')
-        # score = self.frotz_lib.get_score()
-        # reward = score - old_score
-        # return next_state, reward, (self.game_over() or self.victory()),\
-        #     {'moves':self.get_moves(), 'score':score}
-        self.action_history.append(action)
-        return self.env.step(action)
-
-# 返回一个有效的动作列表
     def get_valid_actions(self, use_object_tree=True, use_ctypes=True, use_parallel=True):
         """
         Attempts to generate a set of unique valid actions from the current game state.
@@ -86,16 +48,35 @@ class ZorkEnvWrapper:
         :returns: 一个有效动作的列表。
         """
         return self.env.get_valid_actions(use_object_tree, use_ctypes, use_parallel)
+    def track_visited_room(self):
+        current_room_hash = self.get_wold_state_hash()
+        if current_room_hash not in self.visited_rooms:
+            self.visited_rooms.add(current_room_hash)
+    def get_inverntory(self):
+        ''' Returns a list of :class:`jericho.ZObject` in the player's posession. '''
+        return self.env.get_inventory()
+    def step(self, action):
+        # old_score = self.frotz_lib.get_score()
+        # next_state = self.frotz_lib.step(action_bytes + b'\n').decode('cp1252')
+        # score = self.frotz_lib.get_score()
+        # reward = score - old_score
+        # return next_state, reward, (self.game_over() or self.victory()),\
+        #     {'moves':self.get_moves(), 'score':score}
+        self.action_history.append(action)
+        self.track_visited_room()
+        self.feedback = ""
+        return self.env.step(action)
+
+
+
+
+# --------------------------# --------------------------# --------------------------
+# # # # # # # 以下为jericho中的复用
 
 # 玩家物品？ 不知道这个返回值是什么形式
     def get_player_object(self):
         ''' Returns the :class:`jericho.ZObject` corresponding to the player. '''
         return self.env.get_object(self.env.player_obj_num)
-
-# 获取玩家 财产
-    def get_inverntory(self):
-        ''' Returns a list of :class:`jericho.ZObject` in the player's posession. '''
-        return self.env.get_inventory()
 
 # 输入编号， 返回物品
     def get_object(self, obj_num):
@@ -171,7 +152,20 @@ class ZorkEnvWrapper:
 # --------------------------# 
 # 不知道啥用
 
+# 查看游戏种子, 没什么用
+    def seed(self, seed=None):
+        '''
+        Changes seed used for the emulator's random number generator.
 
+        :param seed: Seed the random number generator used by the emulator.
+                     Default: use walkthrough's seed if it exists,
+                              otherwise use value of -1 which changes with time.
+        :returns: The value of the seed.
+
+        .. note:: :meth:`jericho.FrotzEnv.reset()` must be called before the seed takes effect.
+        '''
+        return self.env.seed(seed)
+    
 # 这个函数在评什么分？ 似乎有用
     def _score_object_names(self, interactive_objs):
         """ Attempts to choose a sensible name for an object, typically a noun. """
@@ -276,7 +270,7 @@ class ZorkEnvWrapper:
     def new_place_reward(self):
         current_room_hash = self.get_wold_state_hash()
         if current_room_hash not in self.visited_rooms:
-            self.track_visited_room(current_room_hash)
+            # self.track_visited_room(current_room_hash)
             # 奖励值与已访问房间数量成对数增长
             return 0.2
         return 0
@@ -302,18 +296,18 @@ class ZorkEnvWrapper:
     def obj_reward(self):
         inventory = self.get_inverntory()
         reward = 0
-        for obj in inventory:
-            obj_hash = hash(obj)  # 使用物品的哈希值作为唯一标识
-            if obj_hash not in self.visited_rooms:  # 复用 visited_rooms 记录已获得物品
-                self.visited_rooms.add(obj_hash)
-                reward += 0.8
+        # for obj in inventory:
+        #     obj_hash = hash(obj)  # 使用物品的哈希值作为唯一标识
+        #     if obj_hash not in self.obj_touched:  # 复用 visited_rooms 记录已获得物品
+        #         self.obj_touched.add(obj_hash)
+        #         reward += 0.8
         return reward
 
 
-# 5.鼓励 agent 对世界做出改变， 上面有一个_world_change 可以判断上一个动作是否对世界改变
+    # 5.若 agent 没有改变世界，小幅度扣分
     def change_world_reward(self):
         world_changed = int(self._world_changed())
-        return 0.2* world_changed  
+        return 0.1 * (world_changed  - 1)
         
     
 # 6.可能没必要: 增加一个存活时间奖励
