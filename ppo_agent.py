@@ -4,6 +4,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig
+import torch.utils.checkpoint as checkpoint
+checkpoint._CHECKPOINT_ALWAYS_USE_REENTRANT = False
+
 from peft import get_peft_model, prepare_model_for_kbit_training
 from config import (
     MODEL_PATH, device, lora_config,
@@ -11,6 +14,22 @@ from config import (
     GAE_LAMBDA, PPO_CLIP_EPS,MAX_HISTORY_LENGTH)
 from Qwen_chat7b_int4.qwen_generation_utils import make_context, get_stop_words_ids, decode_tokens
 
+def load_model_without_warnings():
+    import warnings
+    from transformers.utils import logging
+    logger = logging.get_logger("transformers.modeling_utils")
+    original_level = logger.level
+    logger.setLevel(logging.ERROR)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        device_map="auto",
+        use_flash_attn=True,
+        trust_remote_code=True,
+        use_cache=False 
+    )
+    logger.setLevel(original_level)
+    return model
 
 class PPOAgent():
     def __init__(self, device = device):
@@ -23,14 +42,16 @@ class PPOAgent():
             padding_side='left'
         )
         self.device = device  
-        self.model = AutoModelForCausalLM.from_pretrained(
-            MODEL_PATH,
-            device_map="auto",
-            use_flash_attn=True,
-            use_cache=False,  # 说是显式设置为 False 以兼容梯度检查点
-            trust_remote_code=True,
-            ignore_mismatched_sizes=True  # 忽略不匹配的权重
-        )
+        # self.model = AutoModelForCausalLM.from_pretrained(
+        #     MODEL_PATH,
+        #     device_map="auto",
+        #     use_flash_attn=True,
+        #     use_cache=False,  # 说是显式设置为 False 以兼容梯度检查点
+        #     trust_remote_code=True,
+        #     # strict=False,  # 允许部分权重未加载
+        #     ignore_mismatched_sizes=True  # 忽略参数尺寸不匹配的权重
+        # )
+        self.model = load_model_without_warnings()
         self.entropy_coeff = ENTROPY_COEFF
         self.actor = PPOActor(self)
         self.critic = PPOCritic(self)
@@ -44,10 +65,11 @@ class PPOAgent():
                           gamma=GAMMA_DISCNT, 
                           gae_lambda=GAE_LAMBDA,
                           normalize: bool = True) -> torch.Tensor:
-        # device = state_values.device
-        # state_values = state_values.to(device)
         step_rewards = torch.tensor(step_rewards, dtype=torch.float32, device=device)
-        state_values = torch.tensor(state_values, dtype=torch.float32, device=device)
+        if isinstance(state_values, torch.Tensor):
+            state_values = state_values.clone().detach().to(device).requires_grad_(True)
+        else:
+            state_values = torch.tensor(state_values, dtype=torch.float32, device=device, requires_grad=True)
 
         T = len(step_rewards)
         advantages = torch.zeros_like(step_rewards, device=device)
@@ -58,35 +80,42 @@ class PPOAgent():
                 last_gae = delta + gamma * gae_lambda * last_gae
                 advantages[t] = last_gae
                 next_value = state_values[t]
-        returns = advantages + state_values[:-1]
+        returns = advantages + state_values
         
-        # 可选：标准化优势
         if normalize and len(advantages) > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         return advantages, returns
     
     def compute_total_return(self, rewards, gamma: float = GAMMA_DISCNT):
-        rewards = torch.tensor(rewards, dtype = torch.float32, device=device)
+        rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
         if gamma == 1.0:
             return rewards.sum().item()
         else:
-            discnt_rewards = rewards * (gamma ** torch.arange(len(rewards),device=rewards.device))
-            return discnt_rewards
+            discnt_factors = gamma ** torch.arange(len(rewards), device=rewards.device)
+            discnt_rewards = rewards * discnt_factors
+            return discnt_rewards.sum().item()
 
     # 计算损失函数
-    def compute_loss(self, batch)->tuple:
-        old_logprob = batch.old_logprobs
-        # logprob = batch.logprob
+    def compute_loss(self, batch):
+        old_logprob = torch.stack(batch.old_logprobs)
         state_values = batch.state_values
+        if isinstance(state_values, torch.Tensor):
+            state_values = state_values.clone().detach().to(device).requires_grad_(True)
+        else:
+            state_values = torch.tensor(state_values, dtype=torch.float32, device=device, requires_grad=True)
+
         step_rewards = batch.step_rewards
         next_value = batch.next_value
         obs = batch.observations
         valid_actions = batch.valid_actions
+        feedback = batch.feedbacks
+        last_step_rewards = step_rewards[1:]
+
         advantages, returns = self.compute_advantage_returns(step_rewards, state_values,next_value)
-        entropy_coef: float = ENTROPY_COEFF,  # 熵奖励权重
-        clip_epsilon: float = PPO_CLIP_EPS,   # PPO截断阈值
+        entropy_coef: float = ENTROPY_COEFF
+        clip_epsilon: float = PPO_CLIP_EPS
         value_coef: float = VALUE_LOSS_COEFF
-        _, logprob = self.actor.generate_action_logprob(obs, valid_actions)
+        _, logprob = self.actor.generate_action_logprob(obs, valid_actions, feedback, last_step_rewards)
 
         ratio = torch.exp(logprob - old_logprob.detach())
         surr1 = ratio * advantages
@@ -104,6 +133,7 @@ class PPOAgent():
         # with torch.no_grad():
         #     approx_kl = 0.5 * torch.mean((old_logprob - logprob)**2)  # Fisher信息近似
 
+        # print("total_loss requires_grad:", total_loss.requires_grad)
         return total_loss 
 
 class PPOActor(nn.Module):
@@ -112,26 +142,22 @@ class PPOActor(nn.Module):
         self.history = []
         self.tokenizer = agent.tokenizer 
         self.actor_model = agent.model
-        # 使用 LoRA 接口及低比特训练配置，仅让 LoRA 参数更新
         self.actor_model = prepare_model_for_kbit_training(self.actor_model, use_gradient_checkpointing=True)
         self.actor_model = get_peft_model(self.actor_model, lora_config)
-        # 冻结除最后两层外的所有参数
         for name, param in self.actor_model.named_parameters():
             if ("h.30" not in name) and ("h.31" not in name):
                 param.requires_grad = False
+            else:
+                param.requires_grad = True
         self.actor_model.train()
         
-        # 加载生成配置
         self.generation_config = GenerationConfig.from_pretrained(
             MODEL_PATH,
             trust_remote_code=True,
-            temperature = 0.7, # 生成时的温度参数, 低了趋向于确定  
+            temperature = 0.7,
             max_length=9,
-            length_penalty=1.2,  # 惩罚值越大生成越短
-            # num_beams=4
             do_sample=True
         )
-        # 注入辅助函数（继承qwen初始模型）
         self.make_context = make_context
         self.get_stop_words_ids = get_stop_words_ids
         self.decode_tokens = decode_tokens
@@ -178,38 +204,34 @@ class PPOActor(nn.Module):
         history.append((query, response))
         return response, history, input_ids, gen_tokens
 
-    def generate_action_logprob(self, obs, valid_actions):
-        prompt = self.build_prompt(obs, valid_actions)
-        response, _, input_ids, gen_tokens = self.chat_with_ids(prompt)
-        self.update_history(prompt, response)
-        try:
-            action_idx = int(response) - 1  # 转换为 0 开始的索引
-            if 0 <= action_idx < len(valid_actions):
+    def generate_action_logprob(self, obs, valid_actions, feedback, step_reward):
+        with torch.no_grad(): 
+            prompt = self.build_prompt(obs, valid_actions,feedback, step_reward)
+            response, _, input_ids, gen_tokens = self.chat_with_ids(prompt)
+            self.update_history(prompt, response)
+        match = re.search(r'\d+', response)
+        if match:
+            try:
+                action_idx = int(match.group()) - 1
                 action = valid_actions[action_idx]
-        except:
+            except:
+                action = ""
+        else:
             action = ""
             
-        # 计算生成动作的 log 概率
-        with torch.no_grad():  # 禁用梯度计算以节省内存
-            outputs = self.actor_model(input_ids)
-            logits = outputs.logits[:, -gen_tokens.size(1):]
-            log_probs = torch.log_softmax(logits, dim=-1)
-            gen_log_probs = log_probs.gather(2, gen_tokens.unsqueeze(-1)).squeeze(-1)
-            total_log_prob = gen_log_probs.sum(dim=-1)
+        outputs = self.actor_model(input_ids)
+        logits = outputs.logits[:, -gen_tokens.size(1):]
+        logits = torch.clamp(logits, -50, 50)
+        log_probs = torch.log_softmax(logits, dim=-1)
+        gen_log_probs = log_probs.gather(2, gen_tokens.unsqueeze(-1)).squeeze(-1)
+        total_log_prob = gen_log_probs.sum(dim=-1)
         
         return action, total_log_prob[0]
 
-    def filter_copyright(self, text):
-        """ 过滤包含版权信息的行 """
-        keywords = ["Copyright", "Microsoft Corporation", "GNU General Public License", "Serial number", "ZORK is a registered trademark"]
-        lines = text.split('\n')
-        filtered = [line for line in lines if not any(kw in line for kw in keywords)]
-        return '\n'.join(filtered).strip()
-
-    def build_prompt(self, obs, valid_actions, feedback = None):
-        # obs = self.filter_copyright(obs)  # 过滤掉包含版权信息的行
+    def build_prompt(self, obs, valid_actions, feedback, step_reward):
         numbered_actions = "\n".join([f" {i+1}: {act}" for i, act in enumerate(valid_actions)])
-        prompt = f"""Your last action reward is {feedback}
+        # print(f"Your last action reward is {step_reward}.{feedback}")
+        prompt = f"""Your last action reward is {step_reward}.{feedback}
 # Current Environment Description:
 {obs}
 # Valid Actions:  
@@ -218,48 +240,29 @@ Only answer A SINGLE NUMBER from 1 to {len(valid_actions)}!
 No any additional characters or explanation!"""
         return prompt
     
-    ###############################
-    #            Critic           #
-    ###############################
+
 class PPOCritic(nn.Module):
     def __init__(self,agent):
         super().__init__()
         self.tokenizer = agent.tokenizer
         self.critic_model = agent.model
-        # 使用 LoRA 接口及低比特训练配置， 但不进行训练
         self.critic_model = prepare_model_for_kbit_training(self.critic_model, use_gradient_checkpointing=True)
         self.critic_model = get_peft_model(self.critic_model, lora_config)
-
-        # 添加这个 value_head：从 pooled embedding -> 状态价值
         self.value_head = nn.Linear(self.critic_model.config.hidden_size, 1)
 
-    # 与 Actor 部分类似，使用 Critic 模型进行前向传播
-    def forward(self, obs):
-        # 将输入文本转换为token ids，同时获取attention mask
+    @torch.no_grad()
+    def evaluate_value(self, obs):
         tokenized = self.tokenizer(
             obs, 
             return_tensors="pt", 
             padding=True,
-            return_attention_mask=True  # 显式要求返回attention mask
+            return_attention_mask=True 
         ).to(device)
-        
         input_ids = tokenized.input_ids
-        with torch.no_grad():
-            outputs = self.critic_model(input_ids, output_hidden_states=True)
-            
-            # last_hidden_state = outputs.hidden_states[-1].to(dtype=torch.float32)  # 转换为 float32 类型
-            # pooled = last_hidden_state.mean(dim=1)
-            pooled = outputs.hidden_states[-1].mean(dim=1).to(torch.float32)
+        outputs = self.critic_model(input_ids, output_hidden_states=True)
+        pooled = outputs.hidden_states[-1].mean(dim=1).to(torch.float32)
 
-        # state_value = self.value_head(pooled).squeeze(-1) 
-        # state_value = state_value.float()  # 转换为 float32 类型
         return self.value_head(pooled).squeeze(-1) 
 
-    # 计算 状态价值
-    def evaluate_value(self, obs):
-        return self.forward(obs)
 
-    # 计算 价值损失
-    def compute_value_loss(self, values, returns):
-        return F.mse_loss(values, returns)
     
