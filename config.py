@@ -10,21 +10,21 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # PPO 参数
 PPO_CLIP_EPS = 0.2      # PPO 的 clip epsilon
-PPO_EPOCHS = 2          # 训练时 PPO 的 epoch 数
+PPO_EPOCHS = 4          # 训练时 PPO 的 epoch 数
 PPO_LR = 1e-6           # 学习率
-MAX_GRAD_NORM = 0.5     # 梯度裁剪的最大范数
-ENTROPY_COEFF = 0.03    # 熵正则化系数 通常0.01-0.05
+MAX_GRAD_NORM = 0.5     # 梯度裁剪的最大范数， 爆炸的话增加这个
+ENTROPY_COEFF = 0.03    # 熵正则系数 通常0.01-0.05
 ENTROPY_DECAY = 0.995      # 熵衰减系数
 VALUE_LOSS_COEFF = 0.5  # 价值损失系数：控制 critic 网络学习的重要性，大可能压制策略更新，小可能学习不到准确状态
 
 # 训练参数
-MAX_EPISODES = 10       # 总回合数
-EPISODE_STEPS = 8     # 单个回合最大步数
-ACCUMULATION_STEP = 4   # 累积梯度的步数
-BATCH_SIZE = 8          # 批次大小 
+MAX_EPISODES = 6       # 总回合数
+EPISODE_STEPS = 20     # 单个回合最大步数
+BATCH_SIZE = 4          # 批次大小 
+# ACCUMULATION_STEP = 4   # 累积梯度的步数
 
-EPISODES_PER_UPDATE = 2  # 每次更新的回合数
-MAX_TOTAL_STEPS = 10000  # 最大训练步数
+# EPISODES_PER_UPDATE = 2  # 每次更新的回合数
+# MAX_TOTAL_STEPS = 10000  # 最大训练步数
 SAVE_INTERVAL = 50  # 保存模型的间隔步数
 
 # PPOBuffer 参数
@@ -39,6 +39,7 @@ MAX_HISTORY_LENGTH = 10  # agent 的历史记录动作次数上限
 # Env 参数
 GAME_RATIO = 2         # 计算 reward 时 游戏得分 的比例 
 MAX_NO_SCORE_TIME = 5   # 连续 __ 步没有得分(就惩罚)
+MAX_ACTION_HISTORY = 10 # 记录过去动作
 
 # ============================ LoRA 配置 ============================
 lora_config = LoraConfig(
