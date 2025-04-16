@@ -46,6 +46,7 @@ pip install torch transformers peft jericho
 wget https://github.com/BYU-PCCL/z-machine-games/archive/master.zip
 unzip master.zip
 ```
+其余信息见 `requirements.txt`
 
 ## 使用方法
 
