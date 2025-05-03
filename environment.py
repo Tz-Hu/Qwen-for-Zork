@@ -116,11 +116,10 @@ class ZorkEnvWrapper:
 
     def repetitive_action_penalty(self, action):
         penalty = 0.0
-        # 连续重复动作
         if len(self.action_history) >= 5 and all(a == action for a in list(self.action_history)[-5:]):
             penalty -= 0.3
             self.feedback = f" Don't repeate {action}\n"
-
+            return penalty
         # 循环往返检测，如 ABAB 或 ABCABC
         for cycle_len in [2, 3]:
             if len(self.action_history) >= cycle_len * 2:
@@ -128,8 +127,9 @@ class ZorkEnvWrapper:
                 first, second = seq[:cycle_len], seq[cycle_len:]
                 if first == second:
                     penalty -= 3 
-                    self.feedback = f" Don't loop {first} {second}\n"
-                    break
+                    self.feedback = f" Don't loop between{first}\n"
+                    return penalty
+        self.feedback = ''
         return penalty
     
     def new_place_reward(self):
@@ -146,8 +146,8 @@ class ZorkEnvWrapper:
             return 0
         
     def unrecognized_panalty(self, action):
-        recognized : bool = util.recognized(action)
-        if not recognized:
+        # recognized : bool = util.recognized(action)
+        if action == '404NotFound':
             self.feedback = f" Answer only with NUMBERs(action index)!\n"
             return -1
         return 0
@@ -179,3 +179,113 @@ class ZorkEnvWrapper:
     def get_score(self):
         ''' Returns the current integer game score  '''
         return self.env.get_score()
+    
+    
+# 6.可能没必要: 增加一个存活时间奖励
+# 7.可能没必要(得分情况太稀疏了): 连续 no_score_time 步没有得分惩罚,
+# # 倒是可以设置一个 连续 no_score_time 步没有正向 reward -》 惩罚
+
+# 玩家物品？ 不知道这个返回值是什么形式
+    def get_player_object(self):
+        ''' Returns the :class:`jericho.ZObject` corresponding to the player. '''
+        return self.env.get_object(self.env.player_obj_num)
+
+# 输入编号， 返回物品
+    def get_object(self, obj_num):
+        '''
+        Returns a :class:`jericho.ZObject` with the corresponding number or `None` if the object\
+        doesn't exist in the :doc:`object_tree`.
+
+        :param obj_num: Object number between 0 and len(get_world_objects()).
+        :type obj_num: int
+        '''
+        return self.env.get_object(obj_num)
+    
+
+# 查看游戏种子, 没什么用
+    def seed(self, seed=None):
+        '''
+        Changes seed used for the emulator's random number generator.
+
+        :param seed: Seed the random number generator used by the emulator.
+                     Default: use walkthrough's seed if it exists,
+                              otherwise use value of -1 which changes with time.
+        :returns: The value of the seed.
+
+        .. note:: :meth:`jericho.FrotzEnv.reset()` must be called before the seed takes effect.
+        '''
+        return self.env.seed(seed)
+# 这个函数在评什么分？ 似乎有用
+    def _score_object_names(self, interactive_objs):
+        """ Attempts to choose a sensible name for an object, typically a noun. """
+        def score_fn(obj):
+            score = -.01 * len(obj[0])
+            if obj[1] == 'NOUN':
+                score += 1
+            if obj[1] == 'PROPN':
+                score += .5
+            if obj[1] == 'ADJ':
+                score += 0
+            if obj[2] == 'OBJTREE':
+                score += .1
+            return score
+        best_names = []
+        for desc, objs in interactive_objs.items():
+            sorted_objs = sorted(objs, key=score_fn, reverse=True)
+            best_names.append(sorted_objs[0][0])
+        return best_names
+
+
+# 辨认可交互的 物品/地点
+    def _identify_interactive_objects(self, observation='', use_object_tree=False):
+        """
+        Identifies objects in the current location and inventory that are likely
+        to be interactive.
+        确定当前地点和库存中可能是可交互的对象。
+
+        :param observation: (optional) narrative response to the last action, used to extract candidate objects.
+        :param observation: （可选）对上一个动作的叙述响应，用于提取候选对象。
+        :type observation: string
+        :type observation: 字符串
+        :param use_object_tree: Query the :doc:`object_tree` for names of surrounding objects.
+        :param use_object_tree: 查询 :doc:`object_tree` 以获取周围对象的名称。
+        :type use_object_tree: boolean
+        :type use_object_tree: 布尔值
+        :returns: A list-of-lists containing the name(s) for each interactive object.
+        :returns: 一个包含每个可交互对象名称的列表的列表。
+
+        :Example:
+        :示例:
+
+        >>> from jericho import *
+        >>> env = FrotzEnv('zork1.z5')
+        >>> obs, info = env.reset()
+        'You are standing in an open field west of a white house with a boarded front door. There is a small mailbox here.'
+        >>> env.identify_interactive_objects(obs)
+        [['mailbox', 'small'], ['boarded', 'front', 'door'], ['white', 'house']]
+
+        .. note:: Many objects may be referred to in a variety of ways, such as\
+        Zork1's brass latern which may be referred to either as *brass* or *lantern*.\
+        This method groups all such aliases together into a list for each object.
+        
+        .. 注意:: 许多对象可能有多种称呼，例如 Zork1 的黄铜灯笼可以称为 *brass* 或 *lantern*。\
+        此方法将所有这些别名分组到每个对象的一个列表中。
+        """
+        return self.env._identify_interactive_objects(observation, use_object_tree)
+
+# 依旧不知道咋用
+    def _filter_candidate_actions(self, candidate_actions, use_ctypes=False, use_parallel=False):
+        """
+        给定一个候选动作列表，返回一个字典，将世界差异映射到导致该差异的候选动作列表。
+        仅返回导致有效世界差异的动作。
+
+        :param candidate_actions: 要测试 validity 的 candidate action
+        :type candidate_actions: list
+        :param use_ctypes: 使用优化的 ctypes 实现来过滤有效动作。
+        :type use_ctypes: boolean
+        :param use_parallel: 使用并行化实现来过滤有效动作。
+        :type use_parallel: boolean
+        :returns: 世界差异到动作列表的字典。
+        """
+        return self.env._filter_candidate_actions(candidate_actions, use_ctypes, use_parallel)
+        
