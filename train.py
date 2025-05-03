@@ -79,14 +79,14 @@ def train():
             print(f"\nEpisode {ep} finished, total score: {zork_env.get_score()}\nNow begin loss computation:")
             for epoch in range(PPO_EPOCHS):
                 print(f"\nepoch{epoch+1}/{PPO_EPOCHS}")
+                log_file.write(f"\nepoch{epoch+1}/{PPO_EPOCHS}\n")
                 i = 1
                 for batch in buffer.get_batches(BATCH_SIZE):
                     optimizer.zero_grad()
                     with autocast():
                         loss = agent.compute_loss(batch)
                     print(f"[GPU] Allocated: {torch.cuda.memory_allocated() / 1024 ** 2:.2f} MB | Cached: {torch.cuda.memory_reserved() / 1024 ** 2:.2f} MB")
-                    print("-"*50+f"batch {i}/{BATCH_SIZE}:, loss = {loss.item():.4f}")
-                    log_file.write(f"\nepoch{epoch+1}/{PPO_EPOCHS}\n")
+                    print("-"*50+f"batch {i}/{EPISODE_STEPS/BATCH_SIZE}:, loss = {loss.item():.4f}")
                     log_file.write(f"batch {i}/{EPISODE_STEPS/BATCH_SIZE}, loss = {loss:.3f}\n")
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
@@ -98,6 +98,6 @@ def train():
                     i +=1
             discnt_returns = agent.compute_total_return(buffer.step_rewards)
             with open(return_log_path, "a", encoding="utf-8") as total_log_file:
-                total_log_file.write(f"Ep {ep:03d} ,Move {info['moves']}\tdiscnt Return : {discnt_returns:.3f}\tscore: {zork_env.get_score()}\n")
+                total_log_file.write(f"Ep {ep:02d} |Move {info['moves']:02d}\t|Return : {discnt_returns:.2f}\t|score: {zork_env.get_score()}\n")
         buffer.reset()
     print("Training complete.")
