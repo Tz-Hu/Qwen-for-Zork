@@ -215,9 +215,9 @@ class PPOActor(nn.Module):
                 action_idx = int(match.group()) - 1
                 action = valid_actions[action_idx]
             except:
-                action = ""
+                action = "404NotFound"
         else:
-            action = ""
+            action = "404NotFound"
             
         outputs = self.actor_model(input_ids)
         logits = outputs.logits[:, -gen_tokens.size(1):]
@@ -231,7 +231,7 @@ class PPOActor(nn.Module):
     def build_prompt(self, obs, valid_actions, feedback, step_reward):
         numbered_actions = "\n".join([f" {i+1}: {act}" for i, act in enumerate(valid_actions)])
         # print(f"Your last action reward is {step_reward}.{feedback}")
-        prompt = f"""Your last action reward is {step_reward}.{feedback}
+        prompt = f"""Last action reward is {step_reward}.{feedback}
 # Current Environment Description:
 {obs}
 # Valid Actions:  
